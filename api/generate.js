@@ -1,5 +1,20 @@
 export default async function handler(req, res) {
-  console.log("Function started..."); // DEBUG LOG
+  // Set CORS headers to allow requests from any origin
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+  );
+
+  // Handle preflight OPTIONS request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  console.log("Function started... Method:", req.method); // DEBUG LOG
 
   // 1. Check for Fetch API (Crucial for Node versions < 18)
   if (!globalThis.fetch) {
@@ -48,8 +63,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing 'inputs' field in JSON." });
     }
 
-    // 4. Linear Token Loop (Safer than recursion)
+    // 4. Linear Token Loop with Timeout
     let lastError = null;
+    
+    // Create an AbortController to kill the request if it takes > 8 seconds
+    // Vercel Free Tier has a 10s limit; we stop at 8s to return a graceful error.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i];
@@ -68,8 +88,12 @@ export default async function handler(req, res) {
               inputs: promptText, 
               parameters: { max_new_tokens: 60, return_full_text: false } 
             }),
+            signal: controller.signal
           }
         );
+        
+        // Clear timeout if request succeeds
+        clearTimeout(timeoutId);
 
         // If success, return immediately
         if (response.ok) {
@@ -90,10 +114,17 @@ export default async function handler(req, res) {
         lastError = `Token #${i + 1} error: ${response.status}`;
         
       } catch (networkError) {
+        if (networkError.name === 'AbortError') {
+             console.error("HF Request Timed Out (8s limit)");
+             return res.status(504).json({ error: "AI Generation timed out." });
+        }
         console.error(`Network error with Token #${i + 1}:`, networkError);
         lastError = networkError.message;
       }
     }
+    
+    // Ensure timeout is cleared if loop finishes
+    clearTimeout(timeoutId);
 
     // If loop finishes without returning, all tokens failed
     console.error("All tokens exhausted.");
