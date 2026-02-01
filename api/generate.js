@@ -1,84 +1,106 @@
 export default async function handler(req, res) {
+  console.log("Function started..."); // DEBUG LOG
+
+  // 1. Check for Fetch API (Crucial for Node versions < 18)
+  if (!globalThis.fetch) {
+    console.error("Fetch API missing. Node version might be too old.");
+    return res.status(500).json({ error: "Server Configuration Error: Node.js 18+ required." });
+  }
+
   try {
-    // 1. Get tokens from Environment Variables
+    // 2. Parse Environment Variables
     const rawTokens = process.env.HF_TOKENS || "";
-    const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t);
+    // Split by comma, trim whitespace, and remove empty strings
+    const tokens = rawTokens.split(',').map(t => t.trim()).filter(Boolean);
 
-    // If no tokens are set, strictly return 500 but don't crash the function
+    console.log(`Found ${tokens.length} tokens.`); // DEBUG LOG
+
     if (tokens.length === 0) {
-      console.error("HF_TOKENS not set in Vercel Environment Variables");
-      return res.status(500).json({ error: "Server Configuration Error: No API tokens found." });
+      console.error("No tokens found in HF_TOKENS environment variable.");
+      return res.status(500).json({ error: "Server Error: API tokens missing." });
     }
 
-    // 2. Robust Body Parsing (The Fix)
-    // Vercel parses JSON automatically. We check if it's already an object.
-    let inputs;
+    // 3. Robust Body Parsing
+    let promptText = "";
+    
+    // Check if body exists
+    if (!req.body) {
+      console.error("Request body is empty.");
+      return res.status(400).json({ error: "Missing request body." });
+    }
+
     try {
+      // If Vercel parsed it as an object
       if (typeof req.body === 'object') {
-        inputs = req.body.inputs;
-      } else if (typeof req.body === 'string') {
+        promptText = req.body.inputs;
+      } 
+      // If it came as a string
+      else if (typeof req.body === 'string') {
         const parsed = JSON.parse(req.body);
-        inputs = parsed.inputs;
-      } else {
-        // Fallback if body is missing
-        return res.status(400).json({ error: "Missing request body" });
+        promptText = parsed.inputs;
       }
-    } catch (e) {
-      return res.status(400).json({ error: "Invalid JSON body" });
+    } catch (parseError) {
+      console.error("JSON Parsing failed:", parseError);
+      return res.status(400).json({ error: "Invalid JSON format." });
     }
 
-    // 3. Recursive function to try tokens until one works
-    async function tryGenerate(index) {
-      if (index >= tokens.length) {
-        return res.status(503).json({ error: "All tokens exhausted or busy." });
-      }
+    if (!promptText) {
+      return res.status(400).json({ error: "Missing 'inputs' field in JSON." });
+    }
 
-      const currentToken = tokens[index];
-      
+    // 4. Linear Token Loop (Safer than recursion)
+    let lastError = null;
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      console.log(`Attempting with Token #${i + 1}...`);
+
       try {
         const response = await fetch(
           "https://api-inference.huggingface.co/models/gpt2", 
           {
             headers: { 
-              Authorization: `Bearer ${currentToken}`,
+              Authorization: `Bearer ${token}`,
               "Content-Type": "application/json"
             },
             method: "POST",
             body: JSON.stringify({ 
-              inputs: inputs, 
+              inputs: promptText, 
               parameters: { max_new_tokens: 60, return_full_text: false } 
             }),
           }
         );
 
-        // If rate limited (429) or model loading (503), try next token
+        // If success, return immediately
+        if (response.ok) {
+          const data = await response.json();
+          return res.status(200).json(data);
+        }
+
+        // If rate limit (429) or overloaded (503), continue loop
         if (response.status === 429 || response.status === 503) {
-          console.warn(`Token ${index} failed (${response.status}). Switching...`);
-          return tryGenerate(index + 1);
+          console.warn(`Token #${i + 1} busy (${response.status}). Trying next...`);
+          lastError = `Token #${i + 1} rate limited.`;
+          continue; 
         }
 
-        if (!response.ok) {
-          const errText = await response.text();
-          console.error(`HuggingFace Error (${response.status}):`, errText);
-          throw new Error(`HF Error: ${response.status}`);
-        }
-
-        const result = await response.json();
-        return res.status(200).json(result);
-
-      } catch (error) {
-        console.error(`Error with token ${index}:`, error);
-        // On network error, also try next token
-        return tryGenerate(index + 1);
+        // If other error (401 unauthorized, etc), log and continue
+        const errText = await response.text();
+        console.error(`Token #${i + 1} failed: ${errText}`);
+        lastError = `Token #${i + 1} error: ${response.status}`;
+        
+      } catch (networkError) {
+        console.error(`Network error with Token #${i + 1}:`, networkError);
+        lastError = networkError.message;
       }
     }
 
-    // Start with the first token
-    return await tryGenerate(0);
+    // If loop finishes without returning, all tokens failed
+    console.error("All tokens exhausted.");
+    return res.status(503).json({ error: "All API tokens failed.", details: lastError });
 
-  } catch (globalError) {
-    // Catch-all to prevent FUNCTION_INVOCATION_FAILED
-    console.error("Global API Crash:", globalError);
-    return res.status(500).json({ error: "Internal Server Error", details: globalError.message });
+  } catch (crashError) {
+    console.error("CRITICAL FUNCTION CRASH:", crashError);
+    return res.status(500).json({ error: "Internal Server Crash", details: crashError.message });
   }
 }
